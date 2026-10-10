@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>{% block title %}Verity{% endblock %} · Proof Detective</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
+</head>
+
+<body>
+    {% include 'partials/icons.html' %}
+    <div class="shell">
+        {% include 'partials/sidebar.html' %}
+        <div class="main">
+            {% include 'partials/topbar.html' %}
+            <main class="work" id="view" tabindex="-1">{% block content %}{% endblock %}</main>
+        </div>
+    </div>
+    <div class="scrim" id="scrim"></div>
+    <script type="module" src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+
+</html>

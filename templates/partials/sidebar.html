@@ -1,0 +1,20 @@
+{% set nav = [('dashboard','Overview','grid'),('new','New Computation','plus'),('lab','Investigation
+Lab','search'),('report','Investigation Reports','file'),('audit','Audit Trail','list')] %}
+<aside class="side" id="side" aria-label="Primary">
+  <a class="brand" href="#/dashboard">
+    <svg class="i logo">
+      <use href="#i-shield" />
+    </svg>
+    <span><b>VERITY</b><small>PROOF DETECTIVE</small></span>
+  </a>
+  <nav class="nav">
+    {% for key, label, icon in nav %}
+    <a href="#/{{ key }}" data-route="{{ key }}"><svg class="i">
+        <use href="#i-{{ icon }}" />
+      </svg>{{ label }}</a>
+    {% endfor %}
+  </nav>
+  <div class="integ" id="integ">
+    <div class="mut">Checking integrations…</div>
+  </div>
+</aside>
