@@ -1,5 +1,5 @@
 # Virtual environments
-.venv/
+.venv*/
 venv/
 env/
 ENV/
@@ -29,3 +29,10 @@ Thumbs.db
 .idea/
 *.sublime-project
 *.sublime-workspace
+
+# Generated toolchain output
+**/target/
+**/node_modules/
+verity-chain/artifacts/
+verity-chain/cache/
+verity-chain/types/
