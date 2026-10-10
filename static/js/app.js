@@ -5,11 +5,11 @@ import * as pages from "./pages.js";
 const ROUTES = { dashboard: pages.dashboard, new: pages.newComputation, lab: pages.lab, report: pages.reports, audit: pages.audit };
 
 function renderIntegrations() {
-    const i = state.integ, sim = i.proof_engine.mode === "SIMULATION";
+    const i = state.integ, sim = i.proof_engine.mode === "SIMULATION", ready = i.proof_engine.available;
     $("#integ").innerHTML = `<div class="lbl">INTEGRATIONS</div>
-    <div><div class="ln"><span>Proof engine</span>${badge(sim ? "SIMULATED" : "PASSED").replace(/>[^<]*<\/span>$/, `>${sim ? "SIMULATION" : "REAL"}</span>`)}</div><div class="mut">${E(i.proof_engine.name)}</div></div>
+    <div><div class="ln"><span>Proof engine</span>${badge(sim ? "SIMULATED" : ready ? "PASSED" : "INCOMPLETE").replace(/>[^<]*<\/span>$/, `>${sim ? "SIMULATION" : ready ? "READY" : "UNAVAILABLE"}</span>`)}</div><div class="mut">${E(i.proof_engine.name)}</div><div class="mut">${E(i.proof_engine.detail || "")}</div></div>
     <div><div class="ln"><span>Blockchain</span>${badge(i.blockchain.enabled ? "CONFIRMED" : "NOT_SUBMITTED").replace(/>[^<]*<\/span>$/, `>${i.blockchain.enabled ? "ENABLED" : "DISABLED"}</span>`)}</div><div class="mut">${E(i.blockchain.name)}</div></div>`;
-    const env = $("#env"); env.textContent = sim ? "SIMULATION MODE" : "LIVE VERIFICATION"; env.classList.toggle("real", !sim);
+    const env = $("#env"); env.textContent = sim ? "SIMULATION MODE" : ready ? "RISC ZERO AVAILABLE" : "PROVER UNAVAILABLE"; env.classList.toggle("real", !sim && ready);
 }
 
 async function route() {

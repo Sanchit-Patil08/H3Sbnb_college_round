@@ -1,5 +1,7 @@
 """Verity backend. Proof and blockchain engines sit behind adapters (see ProofEngine / ChainAdapter)."""
-import hashlib, importlib.util, json, os, sqlite3, sys, uuid
+import hashlib, importlib.util, json, os, sqlite3, subprocess, sys, uuid
+from functools import wraps
+from threading import Lock
 from pathlib import Path
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -13,8 +15,14 @@ if __name__ == "__main__" and importlib.util.find_spec("web3") is None:
 from flask import Flask, g, jsonify, render_template, request
 from web3 import Web3
 
-from services.blockchain import account, contract, w3
-from services.risc0_engine import generate_proof
+from services.blockchain import (
+    ABI_ERROR,
+    CONFIG_ERROR,
+    account,
+    contract,
+    w3,
+)
+from services.risc0_engine import generate_proof, verify_receipt, proof_status
 
 DB = os.environ.get("VERITY_DB", "verity.db")
 app = Flask(__name__, static_folder="static")
@@ -28,6 +36,19 @@ for _id, _rate in (("bonus-10pct@1.0.0", "0.10"), ("bonus-15pct@1.0.0", "0.15"))
     spec = {"id": _id, "rule": f"bonus = salary * {_rate}", "rate": _rate}
     PROGRAMS[_id] = {**spec, "digest": sha(spec)}
 AGREED = "bonus-10pct@1.0.0"
+
+# Bound lock storage; serialize lifecycle changes per request in this local
+# single-process server. Different requests can still prove concurrently.
+_REQUEST_LOCKS = tuple(Lock() for _ in range(64))
+_CHAIN_WRITE_LOCK = Lock()
+
+
+def request_locked(handler):
+    @wraps(handler)
+    def wrapped(rid):
+        with _REQUEST_LOCKS[int(sha(rid)[:8], 16) % len(_REQUEST_LOCKS)]:
+            return handler(rid)
+    return wrapped
 
 # ---------- adapters ----------
 class SimulatedProofEngine:
@@ -53,12 +74,21 @@ class DisabledChain:
 
 
 class RealChain:
-    name = "Local Hardhat verifier network"
+    name = "Local Hardhat commitment registry"
 
     @property
     def status(self):
+        if CONFIG_ERROR:
+            return {"enabled": False, "detail": CONFIG_ERROR}
+        if ABI_ERROR:
+            return {"enabled": False, "detail": ABI_ERROR}
+
         missing = [
-            name for name, value in (("RPC", w3), ("contract", contract), ("verifier", account))
+            name for name, value in (
+                ("BLOCKCHAIN_RPC_URL", w3),
+                ("CONTRACT_ADDRESS", contract),
+                ("VERIFIER_PRIVATE_KEY", account),
+            )
             if value is None
         ]
         if missing:
@@ -73,30 +103,65 @@ class RealChain:
 
         if chain_id != 31337:
             return {"enabled": False, "detail": f"Connected to unexpected chain ID {chain_id}; expected 31337."}
-        return {"enabled": True, "detail": "Connected to Hardhat chain 31337."}
+
+        try:
+            if not w3.eth.get_code(contract.address):
+                return {"enabled": False, "detail": "No contract is deployed at CONTRACT_ADDRESS."}
+            if contract.functions.verifier().call() != account.address:
+                return {"enabled": False, "detail": "VERIFIER_PRIVATE_KEY does not match the contract verifier."}
+        except Exception as exc:
+            return {"enabled": False, "detail": f"Contract check failed ({type(exc).__name__})."}
+
+        return {"enabled": True, "detail": "Connected to the configured audit contract on Hardhat chain 31337."}
 
     @property
     def enabled(self):
         return self.status["enabled"]
 
     def record(self, commitment):
+        # All requests use one signer. Reserve/use its nonce serially, including
+        # the duplicate-record check, to avoid parallel transaction collisions.
+        with _CHAIN_WRITE_LOCK:
+            return self._record(commitment)
+
+    def _record(self, commitment):
         status = self.status
         if not status["enabled"]:
             return {"status": "NOT_SUBMITTED", "tx": None, "detail": status["detail"]}
 
         try:
-            input_commitment = commitment.get("input_commitment") or sha(commitment)
-            program_digest = commitment.get("program_digest") or commitment.get("program_id") or "verity"
+            if commitment.get("proof_verified") is not True:
+                return {"status": "NOT_SUBMITTED", "tx": None, "detail": "A verified RISC Zero receipt is required."}
 
-            input_hash = Web3.keccak(text=str(input_commitment))
-            program_id = Web3.keccak(text=str(program_digest))
+            input_commitment = commitment["input_commitment"]
+            program_digest = commitment["program_digest"]
+            receipt_ref = commitment["receipt_ref"]
+            output_value = commitment["output"]
+            if (
+                not isinstance(input_commitment, str)
+                or len(input_commitment) != 64
+                or not isinstance(program_digest, str)
+                or len(program_digest) != 64
+                or not isinstance(receipt_ref, str)
+                or not receipt_ref.startswith("risc0-")
+                or not isinstance(output_value, str)
+            ):
+                raise ValueError("Invalid proof commitment")
+
+            input_hash = Web3.keccak(hexstr=f"0x{input_commitment}")
+            program_id = Web3.keccak(hexstr=f"0x{program_digest}")
             output_hash = Web3.keccak(text=canon({
                 "version": COMMIT_V,
-                "input_commitment": input_commitment,
-                "program_digest": program_digest,
-                "status": "recorded",
+                "output": output_value,
+                "receipt_ref": receipt_ref,
             }))
-            request_id = Web3.keccak(input_hash + output_hash + os.urandom(16))
+            request_id = Web3.keccak(text=commitment["request_id"])
+            if contract.functions.requestExists(request_id).call():
+                saved = contract.functions.audits(request_id).call()
+                if tuple(saved[:3]) != (input_hash, program_id, output_hash):
+                    raise ValueError("Existing blockchain record does not match this request")
+                return {"status": "RECORDED", "tx": None, "request_id": Web3.to_hex(request_id),
+                        "detail": "Matching commitments already recorded on chain."}
 
             tx = contract.functions.recordAudit(request_id, input_hash, program_id, output_hash).build_transaction({
                 "from": account.address,
@@ -117,7 +182,7 @@ class RealChain:
                 "tx": Web3.to_hex(tx_hash),
                 "request_id": Web3.to_hex(request_id),
                 "block_number": receipt.blockNumber,
-                "detail": "Recorded on the local Hardhat verifier network.",
+                "detail": "Input, program, and output commitments were recorded. The contract does not verify RISC Zero proofs.",
             }
         except Exception as exc:
             return {"status": "FAILED", "tx": None, "detail": str(exc)}
@@ -130,28 +195,84 @@ class Risc0ProofEngine:
         return str((Decimal(inputs["salary"]) * Decimal(PROGRAMS[program_id]["rate"])).quantize(Decimal("0.01")))
 
     def prove(self, program_id, inputs, output):
-        proof_data = generate_proof("sum", [int(Decimal(str(inputs["salary"])) * 100), int(Decimal(str(output)) * 100)])
+        rate_percent = int(Decimal(PROGRAMS[program_id]["rate"]) * 100)
+        salary_cents = int(Decimal(str(inputs["salary"])) * 100)
+        proof_data = generate_proof(
+            "bonus",
+            [salary_cents, rate_percent],
+        )
+        output_cents = int(Decimal(str(output)) * 100)
+        if proof_data["result"] != output_cents:
+            raise RuntimeError("RISC Zero result does not match the computed bonus")
+
         journal = {
             "program_id": program_id,
             "program_digest": PROGRAMS[program_id]["digest"],
             "input_commitment": sha(inputs),
             "output": str(output),
         }
+        receipt_ref = "risc0-" + sha({"proof": proof_data, "journal": journal})[:16]
         return {
-            "receipt_ref": "risc0-" + sha({"proof": proof_data, "journal": journal})[:16],
+            "receipt_ref": receipt_ref,
             "mode": self.mode,
             "journal": journal,
-            "seal": sha(["risc0-seal", proof_data, journal]),
             "proof_verified": proof_data["proof_verified"],
             "native_proof": proof_data,
         }
 
     def verify(self, receipt):
-        if not receipt:
+        if not isinstance(receipt, dict):
             return {"mode": self.mode, "status": "INCOMPLETE", "verified_at": now(), "detail": "No receipt supplied."}
-        ok = bool(receipt.get("proof_verified"))
-        return {"mode": self.mode, "status": "VERIFIED" if ok else "FAILED", "verified_at": now(),
-                "detail": "RISC Zero proof verified successfully." if ok else "RISC Zero proof verification failed."}
+
+        proof = receipt.get("native_proof")
+        journal = receipt.get("journal")
+        if not isinstance(proof, dict) or not isinstance(journal, dict):
+            return {"mode": self.mode, "status": "FAILED", "verified_at": now(), "detail": "Receipt is missing its proof or journal."}
+        if any(not isinstance(journal.get(key), str) for key in ("program_id", "program_digest", "input_commitment", "output")):
+            return {"mode": self.mode, "status": "FAILED", "verified_at": now(), "detail": "Receipt journal has invalid fields."}
+
+        try:
+            verified = verify_receipt(proof.get("receipt"))
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            return {"mode": self.mode, "status": "INCOMPLETE", "verified_at": now(), "detail": f"Verifier unavailable ({type(exc).__name__})."}
+        except (ValueError, subprocess.CalledProcessError):
+            return {"mode": self.mode, "status": "FAILED", "verified_at": now(), "detail": "RISC Zero receipt verification failed."}
+
+        numbers = verified["numbers"]
+        if (
+            verified["operation"] != 5
+            or len(numbers) != 2
+            or proof.get("operation") != 5
+            or proof.get("numbers") != numbers
+            or proof.get("result") != verified["result"]
+        ):
+            return {"mode": self.mode, "status": "FAILED", "verified_at": now(), "detail": "Verified receipt does not match the stored proof data."}
+
+        program = PROGRAMS.get(journal.get("program_id"))
+        if (
+            program is None
+            or program["digest"] != journal.get("program_digest")
+            or int(Decimal(program["rate"]) * 100) != numbers[1]
+        ):
+            return {"mode": self.mode, "status": "FAILED", "verified_at": now(), "detail": "Receipt program does not match the journal."}
+
+        salary = (Decimal(numbers[0]) / 100).quantize(Decimal("0.01"))
+        if journal.get("input_commitment") != sha({"salary": str(salary)}):
+            return {"mode": self.mode, "status": "FAILED", "verified_at": now(), "detail": "Receipt input does not match the journal commitment."}
+
+        try:
+            journal_output_cents = Decimal(journal["output"]) * 100
+        except (KeyError, TypeError, ValueError, InvalidOperation):
+            return {"mode": self.mode, "status": "FAILED", "verified_at": now(), "detail": "Journal output is invalid."}
+        if journal_output_cents != verified["result"]:
+            return {"mode": self.mode, "status": "FAILED", "verified_at": now(), "detail": "Receipt result does not match the journal output."}
+
+        expected_ref = "risc0-" + sha({"proof": proof, "journal": journal})[:16]
+        if receipt.get("receipt_ref") != expected_ref:
+            return {"mode": self.mode, "status": "FAILED", "verified_at": now(), "detail": "Receipt reference does not match the receipt contents."}
+
+        return {"mode": self.mode, "status": "VERIFIED", "verified_at": now(),
+                "detail": "The RISC Zero receipt verified against the embedded guest image and its journal matches the request data."}
 
 ENGINE, CHAIN = Risc0ProofEngine(), RealChain()
 
@@ -174,11 +295,26 @@ def _close(_):
     d = g.pop("db", None)
     if d: d.close()
 
-with sqlite3.connect(DB) as _c: _c.executescript(SCHEMA)
+with sqlite3.connect(DB) as _c:
+    _c.executescript(SCHEMA)
+    # Preserve historical evidence, but never present the former boolean-only
+    # verification as a valid proof under the repaired protocol.
+    for _rid, _submission in _c.execute("select id,submission from requests where submission is not null").fetchall():
+        try:
+            _native = json.loads(_submission).get("receipt", {}).get("native_proof", {})
+            _current = _native.get("protocol") == "verity-risc0/v2"
+        except (ValueError, AttributeError):
+            _current = False
+        if not _current:
+            _c.execute("update requests set status='PROOF_REBUILD_REQUIRED' where id=?", (_rid,))
+_c.close()
 
 def log(rid, typ, status, evidence=None):
     """Hash-chained application log: tamper-evident only to someone holding a trusted copy of the head hash."""
-    d = db(); last = d.execute("select hash from audit order by seq desc limit 1").fetchone()
+    d = db()
+    if not d.in_transaction:
+        d.execute("BEGIN IMMEDIATE")
+    last = d.execute("select hash from audit order by seq desc limit 1").fetchone()
     prev, ts, ev = (last[0] if last else "0" * 64), now(), canon(evidence or {})
     cur = d.execute("insert into audit(ts,request_id,type,status,evidence,prev_hash,hash) values(?,?,?,?,?,?,?)",
                     (ts, rid, typ, status, ev, prev, sha([prev, ts, rid, typ, status, ev])))
@@ -186,7 +322,8 @@ def log(rid, typ, status, evidence=None):
 
 def req_row(r):
     o = dict(r); o["inputs"] = json.loads(o["inputs"]); o["chain_meta"] = json.loads(o["chain_meta"] or "{}")
-    o["has_submission"] = bool(o.pop("submission")); o["agreed_program"] = PROGRAMS[o["program_id"]]
+    o["has_submission"] = bool(o.pop("submission")) and o["status"] != "PROOF_REBUILD_REQUIRED"
+    o["agreed_program"] = PROGRAMS[o["program_id"]]
     return o
 
 def get_req(rid):
@@ -194,21 +331,42 @@ def get_req(rid):
 
 def err(msg, code=400): return jsonify(error=msg), code
 
+
+def load_submission(req):
+    """Reject damaged stored data before comparisons or verifier invocation."""
+    try:
+        sub = json.loads(req["submission"])
+        if not isinstance(sub, dict) or not isinstance(sub.get("receipt"), dict):
+            raise ValueError("Missing receipt")
+        rec = sub["receipt"]
+        journal = rec.get("journal")
+        if not isinstance(journal, dict) or not isinstance(rec.get("receipt_ref"), str):
+            raise ValueError("Missing journal or receipt reference")
+        if any(not isinstance(journal.get(key), str) for key in ("program_id", "program_digest", "input_commitment", "output")):
+            raise ValueError("Invalid journal fields")
+        for output in (sub.get("claimed_output"), journal["output"]):
+            if not isinstance(output, str) or not Decimal(output).is_finite() or Decimal(output) < 0:
+                raise ValueError("Invalid output")
+        return sub
+    except (ValueError, TypeError, InvalidOperation) as exc:
+        raise ValueError("Stored submission is malformed; generate a new valid computation") from exc
+
 # ---------- scenarios ----------
 SCENARIOS = {
     "normal": ("Normal computation", "Provider runs the agreed program on the committed inputs and returns the true result."),
     "altered_output": ("Altered output", "Provider's proof is honest, but the answer delivered to the requester is inflated by 60%."),
     "altered_input": ("Altered input", "Provider computes on a salary 60% higher than the committed one. Treated as a separate test input; the original request is untouched."),
     "wrong_program": ("Different program", "Provider proves execution of a 15% bonus program instead of the agreed 10% one."),
-    "invalid_proof": ("Invalid proof", "Provider returns correct-looking values with a forged proof seal."),
+    "invalid_proof": ("Invalid proof", "Provider returns correct-looking values with a corrupted RISC Zero receipt."),
 }
 
 def make_submission(req, scenario):
     inputs, pid = json.loads(req["inputs"]), req["program_id"]
     if scenario == "normal": return json.loads(req["submission"])
-    out = ENGINE.execute(pid, inputs); sub = {"claimed_output": out, "receipt": ENGINE.prove(pid, inputs, out)}
+    out = ENGINE.execute(pid, inputs); sub = json.loads(req["submission"])
     if scenario == "altered_output":
-        sub["claimed_output"] = str((Decimal(out) * Decimal("1.6")).quantize(Decimal("0.01")))
+        changed = max(Decimal(out) + Decimal("0.01"), Decimal(out) * Decimal("1.6"))
+        sub["claimed_output"] = str(changed.quantize(Decimal("0.01")))
     elif scenario == "altered_input":
         bad = {"salary": str((Decimal(inputs["salary"]) * Decimal("1.6")).quantize(Decimal("0.01")))}
         o2 = ENGINE.execute(pid, bad); sub = {"claimed_output": o2, "receipt": ENGINE.prove(pid, bad, o2), "test_inputs": bad}
@@ -216,14 +374,14 @@ def make_submission(req, scenario):
         o2 = ENGINE.execute("bonus-15pct@1.0.0", inputs)
         sub = {"claimed_output": o2, "receipt": ENGINE.prove("bonus-15pct@1.0.0", inputs, o2)}
     elif scenario == "invalid_proof":
-        sub["receipt"]["seal"] = sha("forged")
+        sub["receipt"]["native_proof"]["receipt"] = {"invalid": "receipt"}
     return sub
 
 # ---------- investigations ----------
 def investigate(req, sub, rid):
     rec = sub.get("receipt"); j = rec["journal"] if rec else None
     v = ENGINE.verify(rec) if rec else {"mode": ENGINE.mode, "status": "INCOMPLETE", "verified_at": now(), "detail": "No receipt supplied."}
-    trusted = j is not None and v["status"] != "FAILED"
+    trusted = j is not None and v["status"] in ("VERIFIED", "SIMULATED")
     ok = "SIMULATED" if ENGINE.mode == "SIMULATION" else "PASSED"
     inputs = json.loads(req["inputs"]); n = [0]
     def ev(label, value):
@@ -277,7 +435,9 @@ def index(): return render_template("index.html")
 
 @app.get("/api/integrations")
 def integrations():
-    return jsonify(proof_engine={"name": ENGINE.name, "mode": ENGINE.mode, "genuine_verification": ENGINE.mode == "RISC0"},
+    status = proof_status() if ENGINE.mode == "RISC0" else {"available": True}
+    return jsonify(proof_engine={"name": ENGINE.name, "mode": ENGINE.mode,
+                                "genuine_verification": ENGINE.mode == "RISC0" and status["available"], **status},
                    blockchain={"name": CHAIN.name, **CHAIN.status},
                    audit_note="Audit log is hash-chained in SQLite. It is application history, not independently anchored or immutable.")
 
@@ -286,10 +446,15 @@ def scenarios(): return jsonify([{"id": k, "title": t, "description": d} for k, 
 
 @app.post("/api/requests")
 def create():
-    b = request.get_json(silent=True) or {}
+    b = request.get_json(silent=True) if request.data else {}
+    if not isinstance(b, dict): return err("JSON body must be an object")
     sal = b.get("salary")
     if isinstance(sal, bool) or not isinstance(sal, (int, float, str)): return err("salary must be a number")
-    try: sal = Decimal(str(sal)).quantize(Decimal("0.01"))
+    try:
+        sal = Decimal(str(sal))
+        if not sal.is_finite() or sal <= 0 or sal > Decimal("100000000"):
+            return err("salary must be > 0 and ≤ 100,000,000")
+        sal = sal.quantize(Decimal("0.01"))
     except InvalidOperation: return err("salary must be a number")
     if not sal.is_finite() or sal <= 0 or sal > Decimal("100000000"): return err("salary must be > 0 and ≤ 100,000,000")
     if b.get("agreed_rate_percent", 10) != 10 or b.get("program_id", AGREED) != AGREED:
@@ -311,10 +476,13 @@ def one(rid):
     return jsonify(req_row(r)) if r else err("not found", 404)
 
 @app.post("/api/requests/<rid>/execute")
+@request_locked
 def execute(rid):
     r = get_req(rid)
     if not r: return err("not found", 404)
     if r["status"] in ("VERIFIED", "REJECTED"): return err(f"request already {r['status']}", 409)
+    if r["submission"] and r["status"] != "PROOF_REBUILD_REQUIRED":
+        return jsonify(req_row(r))
     try:
         inputs = json.loads(r["inputs"]); out = ENGINE.execute(r["program_id"], inputs)
         log(rid, "COMPUTATION_EXECUTED", "EXECUTED", {"mode": ENGINE.mode})
@@ -327,21 +495,33 @@ def execute(rid):
     return jsonify(req_row(get_req(rid)))
 
 @app.post("/api/requests/<rid>/investigate")
+@request_locked
 def run_investigation(rid):
-    r = get_req(rid); scenario = (request.get_json(silent=True) or {}).get("scenario", "normal")
+    body = request.get_json(silent=True) if request.data else {}
+    if not isinstance(body, dict): return err("JSON body must be an object")
+    r = get_req(rid); scenario = body.get("scenario", "normal")
     if not r: return err("not found", 404)
-    if scenario not in SCENARIOS: return err("unknown scenario")
+    if not isinstance(scenario, str) or scenario not in SCENARIOS: return err("unknown scenario")
     if not r["submission"]: return err("execute the computation first", 409)
-    sub = make_submission(r, scenario); run_id = "RUN-" + uuid.uuid4().hex[:8].upper()
+    try:
+        load_submission(r)
+    except ValueError as exc:
+        return err(str(exc), 409)
+    try:
+        sub = make_submission(r, scenario)
+    except Exception as exc:
+        log(rid, "INVESTIGATION_FAILED", "FAILED", {"error": str(exc)})
+        return err(f"investigation failed: {exc}", 502)
+    run_id = "RUN-" + uuid.uuid4().hex[:8].upper()
     log(rid, "VERIFICATION_ATTEMPTED", "STARTED", {"run": run_id, "scenario": scenario})
     fs, v = investigate(r, sub, run_id); verdict = verdict_of(fs); refs = []
     for f in fs: refs.append(log(rid, f"INVESTIGATION_{f['n']}_{f['title'].split()[0].upper()}", f["status"], {"run": run_id, "code": f["code"]}))
     j = sub["receipt"]["journal"] if sub.get("receipt") else None
-    limits = ["Proof engine is a SIMULATION: no genuine cryptographic verification took place." if ENGINE.mode == "SIMULATION" else "Real verifier used.",
+    limits = ["Proof engine is a SIMULATION: no genuine cryptographic verification took place." if ENGINE.mode == "SIMULATION" else "The serialized receipt is re-verified against the embedded RISC Zero guest image off-chain; the contract records commitments and does not verify the proof.",
               "A detected mismatch shows that values differ; it does not identify who changed them or establish intent.",
               "Commitments are stored in the same database as the request; they are not independently anchored until a blockchain adapter is connected.",
               "Audit log is application history (hash-chained), not an immutable record."]
-    rep = {"run_id": run_id, "request_id": rid, "scenario": scenario, "scenario_title": SCENARIOS[scenario][0],
+    rep = {"verification_version": 2, "run_id": run_id, "request_id": rid, "scenario": scenario, "scenario_title": SCENARIOS[scenario][0],
            "scenario_description": SCENARIOS[scenario][1], "generated_at": now(), "request": req_row(r), "mode": ENGINE.mode,
            "claimed_output": sub.get("claimed_output"), "proof_bound_output": j and j["output"],
            "agreed_program": r["program_id"], "proven_program": j and j["program_id"], "findings": fs, "verdict": verdict,
@@ -354,22 +534,69 @@ def run_investigation(rid):
     db().commit(); return jsonify(rep)
 
 @app.post("/api/requests/<rid>/record")
+@request_locked
 def record(rid):
     r = get_req(rid)
     if not r: return err("not found", 404)
-    res = CHAIN.record({"version": COMMIT_V, "input_commitment": r["input_commitment"], "program_digest": r["program_digest"]})
+    if not r["submission"]:
+        return err("execute the computation first", 409)
+
+    try:
+        submission = load_submission(r)
+    except ValueError as exc:
+        return err(str(exc), 409)
+    receipt = submission.get("receipt")
+    verification = ENGINE.verify(receipt)
+    journal = receipt.get("journal") if isinstance(receipt, dict) else None
+    if (
+        verification["status"] != "VERIFIED"
+        or not journal
+        or journal.get("input_commitment") != r["input_commitment"]
+        or journal.get("program_digest") != r["program_digest"]
+        or submission.get("claimed_output") != journal.get("output")
+    ):
+        return err("a valid proof matching this request is required before blockchain recording", 409)
+
+    res = CHAIN.record({
+        "request_id": rid,
+        "proof_verified": True,
+        "input_commitment": r["input_commitment"],
+        "program_digest": r["program_digest"],
+        "output": journal["output"],
+        "receipt_ref": receipt["receipt_ref"],
+    })
+    previous = json.loads(r["chain_meta"] or "{}")
+    if (res["status"] == "RECORDED" and not res.get("tx")
+            and previous.get("request_id") == res.get("request_id")):
+        res = {**previous, **res, "tx": previous.get("tx")}
     db().execute("update requests set chain_status=?, chain_meta=? where id=?", (res["status"], canon(res), rid)); db().commit()
     log(rid, "BLOCKCHAIN_RECORD_ATTEMPTED", res["status"], res); return jsonify(res)
 
 @app.get("/api/requests/<rid>/reports")
 def reports(rid):
-    rows = db().execute("select id,scenario,verdict,mode,created_at from runs where request_id=? order by rowid desc", (rid,))
-    return jsonify([dict(x) for x in rows])
+    if not get_req(rid): return err("not found", 404)
+    rows = db().execute("select id,scenario,verdict,mode,created_at,report from runs where request_id=? order by rowid desc", (rid,))
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["verdict"] = public_report(json.loads(item.pop("report")))["verdict"]
+        items.append(item)
+    return jsonify(items)
+
+
+def public_report(report):
+    if report.get("verification_version") != 2 and report.get("mode") == "RISC0":
+        note = "Historical report predates receipt verification repairs. Run a new computation and investigation."
+        report["verdict"] = report["proof_status"] = "INCOMPLETE"
+        report["limitations"] = [note, *report.get("limitations", [])]
+        for finding in report["findings"]:
+            finding.update(status="INCOMPLETE", code="LEGACY_UNVERIFIED", explanation=note)
+    return report
 
 @app.get("/api/reports/<run_id>")
 def report(run_id):
     x = db().execute("select report from runs where id=?", (run_id,)).fetchone()
-    return jsonify(json.loads(x[0])) if x else err("not found", 404)
+    return jsonify(public_report(json.loads(x[0]))) if x else err("not found", 404)
 
 @app.get("/api/audit")
 def audit():
@@ -384,7 +611,10 @@ def dashboard():
     d = db(); rs = [dict(x) for x in d.execute("select id,status,chain_status from requests")]
     count = lambda s: sum(1 for x in rs if x["status"] == s)
     runs = [dict(x) for x in d.execute("select id,request_id,scenario,verdict,mode,created_at,report from runs order by rowid desc limit 8")]
-    for x in runs: x["findings"] = [{"title": f["title"], "status": f["status"], "code": f["code"]} for f in json.loads(x.pop("report"))["findings"]]
+    for x in runs:
+        report = public_report(json.loads(x.pop("report")))
+        x["verdict"] = report["verdict"]
+        x["findings"] = [{"title": f["title"], "status": f["status"], "code": f["code"]} for f in report["findings"]]
     return jsonify(total=len(rs), verified=count("VERIFIED"), rejected=count("REJECTED"),
                    pending=len(rs) - count("VERIFIED") - count("REJECTED"), simulation_only=d.execute(
                        "select count(distinct request_id) from runs where scenario='normal' and verdict='SIMULATION ONLY'").fetchone()[0],

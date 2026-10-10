@@ -9,7 +9,6 @@ contract VerityAudit {
         bytes32 inputHash;
         bytes32 programId;
         bytes32 outputHash;
-        bool verified;
         uint256 timestamp;
     }
 
@@ -19,8 +18,8 @@ contract VerityAudit {
     event AuditRecorded(
         bytes32 indexed requestId,
         bytes32 inputHash,
-        bytes32 outputHash,
-        bool verified
+        bytes32 programId,
+        bytes32 outputHash
     );
 
     constructor() {
@@ -43,15 +42,14 @@ contract VerityAudit {
             inputHash: inputHash,
             programId: programId,
             outputHash: outputHash,
-            verified: true,
             timestamp: block.timestamp
         });
 
         emit AuditRecorded(
             requestId,
             inputHash,
-            outputHash,
-            true
+            programId,
+            outputHash
         );
     }
 }

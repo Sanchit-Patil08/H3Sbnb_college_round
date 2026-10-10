@@ -1,0 +1,27 @@
+test_import_without_required_env_vars (test_blockchain_config.BlockchainConfigTests.test_import_without_required_env_vars) ... ok
+test_concurrent_creations_preserve_one_audit_chain (test_edge_cases.EdgeCases.test_concurrent_creations_preserve_one_audit_chain) ... ok
+test_concurrent_execution_generates_only_one_receipt (test_edge_cases.EdgeCases.test_concurrent_execution_generates_only_one_receipt) ... ok
+test_corrupt_stored_submissions_fail_closed_without_500 (test_edge_cases.EdgeCases.test_corrupt_stored_submissions_fail_closed_without_500) ... ok
+test_invalid_prover_inputs_do_not_launch_host (test_edge_cases.EdgeCases.test_invalid_prover_inputs_do_not_launch_host) ... ok
+test_missing_resources_and_lifecycle (test_edge_cases.EdgeCases.test_missing_resources_and_lifecycle) ... ok
+test_non_object_and_malformed_investigation_bodies (test_edge_cases.EdgeCases.test_non_object_and_malformed_investigation_bodies) ... ok
+test_repeat_record_preserves_transaction_reference (test_edge_cases.EdgeCases.test_repeat_record_preserves_transaction_reference) ... ok
+test_rounding_matches_integer_oracle_for_1000_seeded_amounts (test_edge_cases.EdgeCases.test_rounding_matches_integer_oracle_for_1000_seeded_amounts) ... ok
+test_salary_boundaries_and_invalid_types (test_edge_cases.EdgeCases.test_salary_boundaries_and_invalid_types) ... ok
+test_scenario_matrix_at_minimum_rounding_and_maximum (test_edge_cases.EdgeCases.test_scenario_matrix_at_minimum_rounding_and_maximum) ... ok
+test_unavailable_or_wrong_blockchain_is_disabled (test_edge_cases.EdgeCases.test_unavailable_or_wrong_blockchain_is_disabled) ... ok
+test_real_arithmetic_zero_duplicates_and_maximum_vector (test_edge_cases.LiveEdges.test_real_arithmetic_zero_duplicates_and_maximum_vector) ... skipped 'Requires real RISC Zero host'
+test_real_bonus_rounding_matrix (test_edge_cases.LiveEdges.test_real_bonus_rounding_matrix) ... skipped 'Requires real RISC Zero host'
+test_full_flow_and_tamper_scenarios_with_mocked_host (test_verification.AppTests.test_full_flow_and_tamper_scenarios_with_mocked_host) ... ok
+test_invalid_requests (test_verification.AppTests.test_invalid_requests) ... ok
+test_legacy_report_is_not_presented_as_verified (test_verification.AppTests.test_legacy_report_is_not_presented_as_verified) ... ok
+test_prover_failures_are_reported_without_losing_request (test_verification.AppTests.test_prover_failures_are_reported_without_losing_request) ... ok
+test_receipt_flag_and_rehashed_journal_cannot_forge_proof (test_verification.AppTests.test_receipt_flag_and_rehashed_journal_cannot_forge_proof) ... ok
+test_verifier_unavailable_is_incomplete (test_verification.AppTests.test_verifier_unavailable_is_incomplete) ... ok
+test_parallel_real_transactions_with_mocked_proofs (test_verification.LiveTests.test_parallel_real_transactions_with_mocked_proofs) ... skipped 'Requires real RISC Zero host and local Hardhat RPC'
+test_real_proof_blockchain_and_tampering (test_verification.LiveTests.test_real_proof_blockchain_and_tampering) ... skipped 'Requires real RISC Zero host and local Hardhat RPC'
+
+----------------------------------------------------------------------
+Ran 22 tests in 3.484s
+
+OK (skipped=4)

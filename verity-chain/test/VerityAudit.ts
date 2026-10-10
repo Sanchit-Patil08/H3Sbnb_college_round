@@ -36,7 +36,7 @@ describe("VerityAudit", function () {
     expect(record.inputHash).to.equal(inputHash);
     expect(record.programId).to.equal(programId);
     expect(record.outputHash).to.equal(outputHash);
-    expect(record.verified).to.equal(true);
+    expect(record.timestamp).to.be.greaterThan(0);
   });
 
   it("rejects unauthorized users", async function () {

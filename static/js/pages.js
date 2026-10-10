@@ -34,18 +34,20 @@ export function newComputation() {
     <button class="btn btn-p" id="go" type="submit">Create request</button><div id="msg" style="margin-top:14px"></div></form>
   <aside class="panel"><header><h2>Calculation preview</h2><span class="sub">local only</span></header><div id="prev"></div>
     <p class="mut" style="margin-top:14px;font-size:.8rem">This is a local preview, not proof verification. On creation the backend stores a SHA-256 commitment of the canonical inputs and the program digest.</p></aside></div>`);
-    const sal = $("#sal"), valid = () => { const n = Number(sal.value); return sal.value !== "" && n > 0 && n <= 1e8; };
+    const sal = $("#sal"), valid = () => { const n = Number(sal.value); return /^\d+(\.\d{1,2})?$/.test(sal.value) && n > 0 && n <= 1e8; };
     const prev = () => {
         const ok = valid(), n = Number(sal.value);
-        sal.classList.toggle("bad", !ok); $("#salerr").textContent = ok ? "" : "Enter a salary greater than 0 and up to 100,000,000.";
-        $("#prev").innerHTML = ok ? `<dl class="kv"><dt>Salary</dt><dd>${inr(n)}</dd><dt>Agreed rate</dt><dd>10%</dd><dt>Formula</dt><dd class="mono">salary × 0.10</dd><dt><b>Expected bonus</b></dt><dd><b>${inr(n * 0.1)}</b></dd></dl>` : `<p class="mut">Enter a valid salary to preview.</p>`;
+        sal.classList.toggle("bad", !ok); $("#salerr").textContent = ok ? "" : "Enter a salary greater than 0 and up to 100,000,000 with at most two decimal places.";
+        const cents = Math.round(n * 100), whole = Math.floor(cents / 10), remainder = cents % 10;
+        const bonus = (whole + Number(remainder > 5 || (remainder === 5 && whole % 2 === 1))) / 100;
+        $("#prev").innerHTML = ok ? `<dl class="kv"><dt>Salary</dt><dd>${inr(n)}</dd><dt>Agreed rate</dt><dd>10%</dd><dt>Formula</dt><dd class="mono">salary × 0.10</dd><dt><b>Expected bonus</b></dt><dd><b>${inr(bonus)}</b></dd></dl>` : `<p class="mut">Enter a valid salary to preview.</p>`;
     };
     sal.oninput = prev; prev();
     $("#f").onsubmit = async e => {
         e.preventDefault(); if (!valid()) return prev();
         const b = $("#go"); b.disabled = true; b.textContent = "Creating…";
         try {
-            const r = await api("/requests", "POST", { salary: Number(sal.value), agreed_rate_percent: 10 });
+            const r = await api("/requests", "POST", { salary: sal.value, agreed_rate_percent: 10 });
             $("#msg").innerHTML = `<div class="alert a-green">${ic("alert")}<div><b>Request ${E(r.id)} created.</b><div style="margin-top:6px">Input commitment ${hash(r.input_commitment)}</div><div style="margin-top:8px"><a href="#/lab/${E(r.id)}">Open in Investigation Lab →</a></div></div></div>`;
         } catch (x) { $("#msg").innerHTML = errBox(x); }
         b.disabled = false; b.textContent = "Create request";
@@ -118,7 +120,7 @@ export async function reports(id) {
   <div><h2 class="sec">Claimed vs proof-bound</h2><dl class="kv"><dt>Claimed output</dt><dd>${inr(r.claimed_output)}</dd><dt>Proof-bound output</dt><dd>${inr(r.proof_bound_output)}</dd><dt>Proven program</dt><dd class="mono">${E(r.proven_program)}</dd></dl></div></section>
   <section><h2 class="sec">Investigation findings</h2>${r.findings.map(finding).join("")}</section>
   <section class="grid2"><div><h2 class="sec">Proof verification</h2>${badge(r.proof_status)}<p class="mut" style="margin-top:6px;font-size:.8rem">Cryptographic status of the receipt, separate from the integrity checks.</p></div>
-  <div><h2 class="sec">Blockchain recording</h2>${badge(r.blockchain_status)}<p class="mut" style="margin-top:6px;font-size:.8rem">Reported separately. A recording failure does not invalidate a verified proof.</p></div></section>
+  <div><h2 class="sec">Blockchain recording</h2>${badge(r.blockchain_status)}<p class="mut" style="margin-top:6px;font-size:.8rem">Commitment hashes only; the contract does not verify the RISC Zero proof. A recording failure does not invalidate a verified proof.</p></div></section>
   <section><h2 class="sec">What this report cannot conclude</h2><ul class="mut">${r.limitations.map(l => `<li>${E(l)}</li>`).join("")}</ul></section>
   <section><h2 class="sec">Audit event references</h2><div class="row">${r.audit_refs.map(a => `<a class="mono" href="#/audit?request_id=${E(r.request_id)}">${E(a)}</a>`).join("")}</div></section></div>`);
 }

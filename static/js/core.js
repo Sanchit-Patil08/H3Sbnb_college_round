@@ -14,7 +14,7 @@ export const state = { integ: null };
 export const ic = n => `<svg class="i" aria-hidden="true"><use href="#i-${n}"/></svg>`;
 export const cls = s => "s-" + String(s).replace(/ /g, "_");
 export const badge = s => `<span class="badge ${cls(s)}">${E(s)}</span>`;
-export const inr = v => v == null ? "—" : "₹" + Number(v).toLocaleString("en-IN", { minimumFractionDigits: 2 });
+export const inr = v => v == null ? "—" : "₹" + Number(v).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 export const when = t => t ? t.replace("T", " ").replace("+00:00", " UTC") : "—";
 export const hash = h => h ? `<button type="button" class="hash mono" data-copy="${E(h)}" title="Click to copy full value: ${E(h)}">${E(h.slice(0, 12))}…${E(h.slice(-4))}${ic("copy")}</button>` : "—";
 export const loading = m => `<div class="state" role="status"><div><span class="spin"></span>${m}…</div></div>`;

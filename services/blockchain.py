@@ -7,8 +7,8 @@ from eth_abi import encode
 from web3 import Web3
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-load_dotenv(BASE_DIR / ".env", override=True)
-load_dotenv(override=True)
+load_dotenv(BASE_DIR / ".env", override=False)
+load_dotenv(override=False)
 
 
 def _read_env(name):
@@ -29,7 +29,8 @@ def _resolve_abi_path():
     candidates = []
 
     if configured:
-        candidates.append(Path(configured).expanduser())
+        configured_path = Path(configured).expanduser()
+        candidates.append(configured_path if configured_path.is_absolute() else BASE_DIR / configured_path)
 
     candidates.extend(
         [
@@ -48,18 +49,28 @@ def _resolve_abi_path():
 
 
 ABI_PATH = _resolve_abi_path()
+ABI_ERROR = None
 
-if ABI_PATH.exists():
-    with open(ABI_PATH, encoding="utf-8") as file:
-        contract_abi = json.load(file)["abi"]
+if ABI_PATH.is_file():
+    try:
+        with open(ABI_PATH, encoding="utf-8") as file:
+            contract_abi = json.load(file)["abi"]
+        if not isinstance(contract_abi, list) or not contract_abi:
+            ABI_ERROR = f"Contract ABI is invalid or empty: {ABI_PATH}"
+            contract_abi = []
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        ABI_ERROR = f"Could not load contract ABI ({type(exc).__name__}): {ABI_PATH}"
+        contract_abi = []
 else:
     contract_abi = []
+    ABI_ERROR = f"Contract ABI file not found: {ABI_PATH}"
 
-w3 = Web3(Web3.HTTPProvider(RPC_URL)) if RPC_URL else None
+w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 5})) if RPC_URL else None
 contract = None
 account = None
+CONFIG_ERROR = None
 
-if w3 is not None and CONTRACT_ADDRESS and PRIVATE_KEY:
+if w3 is not None and CONTRACT_ADDRESS and PRIVATE_KEY and contract_abi:
     try:
         contract = w3.eth.contract(
             address=Web3.to_checksum_address(CONTRACT_ADDRESS),
@@ -67,9 +78,7 @@ if w3 is not None and CONTRACT_ADDRESS and PRIVATE_KEY:
         )
         account = w3.eth.account.from_key(PRIVATE_KEY)
     except (ValueError, TypeError) as exc:
-        w3 = None
-        contract = None
-        account = None
+        CONFIG_ERROR = f"Invalid contract address or verifier key ({type(exc).__name__})"
 
 
 def record_audit(operation, numbers, result, program_id):
